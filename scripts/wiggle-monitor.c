@@ -42,6 +42,8 @@
 #define TRACK_INTERVAL_MS       16
 #define TRACK_ACTIVE_WINDOW_MS  2500
 #define IPC_RESPONSE_TIMEOUT_MS 300
+#define TOUCHPAD_COUNTS_PER_MM  40.0   // Roughly a 1000 DPI mouse
+#define TOUCHPAD_FALLBACK_MM    100.0  // Assumed pad width when no resolution is reported
 
 /* ─── Data Structures ─── */
 
@@ -62,11 +64,25 @@ typedef struct {
 } ShakeDetector;
 
 typedef struct {
+    double scale_x;
+    double scale_y;
+    int    x;
+    int    y;
+    int    last_x;
+    int    last_y;
+    bool   has_last;
+    bool   touching;
+    int    fingers;
+} TouchpadState;
+
+typedef struct {
     struct libevdev *dev;
     int              fd;
     int              pending_dx;
     int              pending_dy;
     char             path[280];
+    bool             is_touchpad;
+    TouchpadState    touchpad;
 } DeviceState;
 
 /* ─── Globals ─── */
@@ -299,6 +315,64 @@ static bool detector_update(ShakeDetector *det, double dx, double dy, int64_t ts
     return false;
 }
 
+/* ─── Touchpad Motion ─── */
+
+static double abs_units_per_mm(const struct input_absinfo *abs) {
+    if (abs->resolution > 0) return abs->resolution;
+    double range = abs->maximum - abs->minimum;
+    return range > 0 ? range / TOUCHPAD_FALLBACK_MM : 1.0;
+}
+
+static void touchpad_init(TouchpadState *tp, const struct libevdev *dev) {
+    const struct input_absinfo *abs_x = libevdev_get_abs_info(dev, ABS_X);
+    const struct input_absinfo *abs_y = libevdev_get_abs_info(dev, ABS_Y);
+    double units_x = abs_units_per_mm(abs_x);
+    double units_y = abs_y->resolution > 0 ? abs_y->resolution : units_x;
+
+    memset(tp, 0, sizeof(*tp));
+    tp->scale_x = TOUCHPAD_COUNTS_PER_MM / units_x;
+    tp->scale_y = TOUCHPAD_COUNTS_PER_MM / units_y;
+}
+
+static void touchpad_handle_event(TouchpadState *tp, const struct input_event *ev) {
+    if (ev->type == EV_ABS) {
+        if (ev->code == ABS_X) tp->x = ev->value;
+        else if (ev->code == ABS_Y) tp->y = ev->value;
+        return;
+    }
+
+    // Only contact and finger-count state is kept; no other key data is read.
+    switch (ev->code) {
+    case BTN_TOUCH:          tp->touching = ev->value != 0; break;
+    case BTN_TOOL_FINGER:    if (ev->value) tp->fingers = 1; break;
+    case BTN_TOOL_DOUBLETAP: if (ev->value) tp->fingers = 2; break;
+    case BTN_TOOL_TRIPLETAP: if (ev->value) tp->fingers = 3; break;
+    case BTN_TOOL_QUADTAP:   if (ev->value) tp->fingers = 4; break;
+    case BTN_TOOL_QUINTTAP:  if (ev->value) tp->fingers = 5; break;
+    default: break;
+    }
+}
+
+/*
+ * Converts the absolute position of a single finger into a relative delta at
+ * the end of each frame. Multi-finger scrolling and gestures are ignored, and
+ * the first frame of a new contact only records its position so lifting and
+ * re-placing a finger never registers as a jump.
+ */
+static void touchpad_finish_frame(TouchpadState *tp, int *dx, int *dy) {
+    bool tracking = tp->touching && tp->fingers == 1;
+
+    if (tracking && tp->has_last) {
+        *dx += (int)lround((tp->x - tp->last_x) * tp->scale_x);
+        *dy += (int)lround((tp->y - tp->last_y) * tp->scale_y);
+    }
+
+    if (!tp->touching) tp->fingers = 0;
+    tp->last_x = tp->x;
+    tp->last_y = tp->y;
+    tp->has_last = tracking;
+}
+
 /* ─── Device Discovery & Hotplug ─── */
 
 static int add_device(const char *path, DeviceState *devices, struct pollfd *pfds, int *active_count) {
@@ -322,7 +396,7 @@ static int add_device(const char *path, DeviceState *devices, struct pollfd *pfd
                   libevdev_has_event_code(dev, EV_REL, REL_X) &&
                   libevdev_has_event_code(dev, EV_REL, REL_Y);
 
-    int is_touchpad = libevdev_has_event_code(dev, EV_ABS, ABS_MT_POSITION_X);
+    int has_mt = libevdev_has_event_code(dev, EV_ABS, ABS_MT_POSITION_X);
     int is_direct = libevdev_has_property(dev, INPUT_PROP_DIRECT);
 
     /*
@@ -330,7 +404,19 @@ static int add_device(const char *path, DeviceState *devices, struct pollfd *pfd
      * event node as REL_X/REL_Y (notably Logitech HID++ devices). Classify by
      * pointer axes here and discard all EV_KEY events in the read loop below.
      */
-    if (!has_rel || is_touchpad || is_direct) {
+    bool is_mouse = has_rel && !has_mt;
+
+    /*
+     * Same rule udev uses for ID_INPUT_TOUCHPAD: absolute X/Y with finger
+     * tools and no pen. Touchscreens are excluded by INPUT_PROP_DIRECT.
+     */
+    bool is_touchpad = !has_rel &&
+                       libevdev_has_event_code(dev, EV_ABS, ABS_X) &&
+                       libevdev_has_event_code(dev, EV_ABS, ABS_Y) &&
+                       libevdev_has_event_code(dev, EV_KEY, BTN_TOOL_FINGER) &&
+                       !libevdev_has_event_code(dev, EV_KEY, BTN_TOOL_PEN);
+
+    if (is_direct || (!is_mouse && !is_touchpad)) {
         libevdev_free(dev);
         close(fd);
         return 0;
@@ -344,6 +430,9 @@ static int add_device(const char *path, DeviceState *devices, struct pollfd *pfd
     devices[idx].fd = fd;
     devices[idx].pending_dx = 0;
     devices[idx].pending_dy = 0;
+    devices[idx].is_touchpad = is_touchpad;
+    if (is_touchpad)
+        touchpad_init(&devices[idx].touchpad, dev);
     snprintf(devices[idx].path, sizeof(devices[idx].path), "%s", path);
 
     pfds[idx].fd = fd;
@@ -521,7 +610,16 @@ int main(int argc, char *argv[]) {
                     else if (ev.code == REL_Y)
                         devices[d].pending_dy += ev.value;
                 }
+                else if (devices[d].is_touchpad && (ev.type == EV_ABS || ev.type == EV_KEY)) {
+                    touchpad_handle_event(&devices[d].touchpad, &ev);
+                }
                 else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                    if (devices[d].is_touchpad) {
+                        touchpad_finish_frame(&devices[d].touchpad,
+                                              &devices[d].pending_dx,
+                                              &devices[d].pending_dy);
+                    }
+
                     int dx = devices[d].pending_dx;
                     int dy = devices[d].pending_dy;
                     devices[d].pending_dx = 0;
@@ -551,12 +649,13 @@ int main(int argc, char *argv[]) {
                         next_track = ts + TRACK_INTERVAL_MS;
                     }
                 }
-                // All other event types (EV_KEY, EV_ABS, EV_MSC, etc.) are explicitly discarded
+                // Everything else, including all EV_KEY and EV_ABS events from mice, is discarded
             }
 
             if (rc == LIBEVDEV_READ_STATUS_SYNC) {
                 devices[d].pending_dx = 0;
                 devices[d].pending_dy = 0;
+                devices[d].touchpad.has_last = false;
                 while (libevdev_next_event(devices[d].dev,
                         LIBEVDEV_READ_FLAG_SYNC, &ev) == LIBEVDEV_READ_STATUS_SYNC)
                     ;

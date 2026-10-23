@@ -5,10 +5,10 @@
 Wiggle implements a minimal-privilege architecture for cursor magnification:
 
 1. **Input Minimization & Permissions:**
-   - `scripts/wiggle-monitor` opens only devices reporting `EV_REL` with axes `REL_X` and `REL_Y`.
+   - `scripts/wiggle-monitor` opens only mice reporting `EV_REL` with axes `REL_X` and `REL_Y`, and touchpads reporting `ABS_X`/`ABS_Y` with `BTN_TOOL_FINGER` (the udev `ID_INPUT_TOUCHPAD` rule).
    - Access to `/dev/input/event*` (`0660 root:input`) is provided by standard Omarchy Quattro user provisioning (`input` supplementary group membership created at install time via `install/hardware/input-group.sh` and `bin/omarchy-provision-owner`).
-   - Touchpads and touchscreens are explicitly rejected. Composite receiver nodes may also advertise keyboard capabilities, but all `EV_KEY` events are discarded without inspection.
-   - All `EV_KEY` (mouse buttons and keys), `EV_ABS`, and `EV_MSC` events are discarded immediately upon reception.
+   - Touchscreens (`INPUT_PROP_DIRECT`), tablets and pens are rejected. Composite receiver nodes may also advertise keyboard capabilities, but all `EV_KEY` events from mice are discarded without inspection.
+   - From mice, all `EV_KEY` (mouse buttons and keys), `EV_ABS`, and `EV_MSC` events are discarded immediately upon reception. From touchpads, only `ABS_X`/`ABS_Y`, `BTN_TOUCH` and the `BTN_TOOL_*` finger-count codes are read, and only single-finger motion reaches the shake detector.
    - Input grabbing (`EVIOCGRAB`) and virtual device creation (`uinput`) are never used by the monitor.
 
 2. **Pointer Position Privacy:**

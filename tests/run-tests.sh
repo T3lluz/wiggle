@@ -36,6 +36,13 @@ gcc -O2 -Wall -Wextra -Werror \
 
 run_test "Shake detection algorithm" "$TEST_DIR/test-shake-detector"
 
+echo "Building touchpad motion tests..."
+gcc -O2 -Wall -Wextra -Werror \
+  -o "$TEST_DIR/test-touchpad-motion" \
+  "$TEST_DIR/test-touchpad-motion.c" -lm 2>&1
+
+run_test "Touchpad motion conversion" "$TEST_DIR/test-touchpad-motion"
+
 # ── 2. Monitor binary exists and starts ──
 run_test "Monitor binary exists" test -x "$PLUGIN_DIR/scripts/wiggle-monitor"
 
