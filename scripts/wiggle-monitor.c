@@ -42,6 +42,7 @@
 #define MAX_DEVICES             16
 #define TRACK_INTERVAL_MS       4      // Faster than common 60-240 Hz displays
 #define TRACK_ACTIVE_WINDOW_MS  2500
+#define TRACK_AFTER_SHOW_MS     600    // Outlasts the shell's 1x proxy release delay
 #define IPC_RESPONSE_TIMEOUT_MS 300
 #define TOUCHPAD_COUNTS_PER_MM  40.0   // Roughly a 1000 DPI mouse
 #define TOUCHPAD_FALLBACK_MM    100.0  // Assumed pad width when no resolution is reported
@@ -579,7 +580,10 @@ int main(int argc, char *argv[]) {
                         fflush(stdout);
                     } else if (strcmp(command, "SHOW") == 0) {
                         bool shown = set_compositor_cursor_invisible(false);
-                        if (shown) compositor_cursor_hidden = false;
+                        if (shown) {
+                            compositor_cursor_hidden = false;
+                            track_until = now_ms() + TRACK_AFTER_SHOW_MS;
+                        }
                         printf(shown ? "SHOWN\n" : "SHOW_FAILED\n");
                         fflush(stdout);
                     }

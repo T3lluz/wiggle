@@ -21,7 +21,7 @@ https://github.com/user-attachments/assets/d1133515-9c44-48a9-8b22-29bc225317ae
 * **Universal Single Proxy Overlay:** Renders identically across applications (terminals, browsers), empty workspaces, and desktop backgrounds on a click-through, focusless overlay (`WlrLayer.Overlay`).
 * **Hotspot-Anchored Precision:** Scales precisely around the cursor hotspot with zero pointer tip drift across all magnification levels.
 * **Theme-Agnostic Asset Discovery:** Automatically discovers the active theme and extracts the highest-resolution arrow/default cursor asset (XCursor bitmaps up to 96px+ or Hyprcursor SVGs).
-* **Defensive Cursor Handoff:** The proxy is presented at 1x before the native cursor is hidden, and HIDE/SHOW operations require compositor acknowledgements. Normal termination and handled failure paths request native-cursor restoration; an unconfirmed SHOW keeps the proxy available as a fallback.
+* **Defensive Cursor Handoff:** The proxy is presented at 1x before the native cursor is hidden, and HIDE/SHOW operations require compositor acknowledgements. After SHOW is acknowledged the 1x proxy stays up for 550ms, because Hyprland only applies `cursor:invisible` on its next 500ms cursor tick. Normal termination and handled failure paths request native-cursor restoration; an unconfirmed SHOW keeps the proxy available as a fallback.
 
 ---
 

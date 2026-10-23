@@ -128,6 +128,12 @@ run_test "Cursor restoration remains visible on acknowledgement failure" bash -c
   awk '/Component.onDestruction:/{seen=1} seen && /restoreState\(\)/{restore=NR} seen && /stopMonitor\(\)/{stop=NR; exit} END{exit !(restore && stop && restore < stop)}' '$PLUGIN_DIR/Wiggle.qml'
 "
 
+run_test "Proxy outlives Hyprland's cursor visibility tick" bash -c "
+  grep -q 'proxyReleaseDelayMs: 550' '$PLUGIN_DIR/Wiggle.qml' &&
+  grep -q 'proxyReleaseTimer.restart()' '$PLUGIN_DIR/Wiggle.qml' &&
+  grep -q 'TRACK_AFTER_SHOW_MS' '$PLUGIN_DIR/scripts/wiggle-monitor.c'
+"
+
 run_test "Warm-up state handles monitor removal" bash -c "
   grep -q 'unregisterWarmupWindow' '$PLUGIN_DIR/Wiggle.qml' &&
   grep -q 'Component.onDestruction: root.unregisterWarmupWindow' '$PLUGIN_DIR/Wiggle.qml'
