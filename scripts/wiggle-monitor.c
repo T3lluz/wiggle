@@ -325,6 +325,23 @@ static double abs_units_per_mm(const struct input_absinfo *abs) {
     return range > 0 ? range / TOUCHPAD_FALLBACK_MM : 1.0;
 }
 
+static void touchpad_sync_state(TouchpadState *tp, const struct libevdev *dev) {
+    static const unsigned int tools[] = {
+        BTN_TOOL_FINGER, BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP,
+        BTN_TOOL_QUADTAP, BTN_TOOL_QUINTTAP,
+    };
+    tp->x = libevdev_get_event_value(dev, EV_ABS, ABS_X);
+    tp->y = libevdev_get_event_value(dev, EV_ABS, ABS_Y);
+    tp->touching = libevdev_get_event_value(dev, EV_KEY, BTN_TOUCH) != 0;
+    tp->fingers = 0;
+    for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
+        if (libevdev_get_event_value(dev, EV_KEY, tools[i]))
+            tp->fingers = (int)i + 1;
+    }
+    // A recovered position establishes a baseline, never a movement jump.
+    tp->has_last = false;
+}
+
 static void touchpad_init(TouchpadState *tp, const struct libevdev *dev) {
     const struct input_absinfo *abs_x = libevdev_get_abs_info(dev, ABS_X);
     const struct input_absinfo *abs_y = libevdev_get_abs_info(dev, ABS_Y);
@@ -334,6 +351,7 @@ static void touchpad_init(TouchpadState *tp, const struct libevdev *dev) {
     memset(tp, 0, sizeof(*tp));
     tp->scale_x = TOUCHPAD_COUNTS_PER_MM / units_x;
     tp->scale_y = TOUCHPAD_COUNTS_PER_MM / units_y;
+    touchpad_sync_state(tp, dev);
 }
 
 static void touchpad_handle_event(TouchpadState *tp, const struct input_event *ev) {
@@ -663,10 +681,11 @@ int main(int argc, char *argv[]) {
             if (rc == LIBEVDEV_READ_STATUS_SYNC) {
                 devices[d].pending_dx = 0;
                 devices[d].pending_dy = 0;
-                devices[d].touchpad.has_last = false;
                 while (libevdev_next_event(devices[d].dev,
                         LIBEVDEV_READ_FLAG_SYNC, &ev) == LIBEVDEV_READ_STATUS_SYNC)
                     ;
+                if (devices[d].is_touchpad)
+                    touchpad_sync_state(&devices[d].touchpad, devices[d].dev);
             } else if (rc < 0 && rc != -EAGAIN) {
                 remove_device(devices, pfds, &active_count, d);
                 continue;

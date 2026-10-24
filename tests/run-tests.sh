@@ -43,6 +43,11 @@ gcc -O2 -Wall -Wextra -Werror \
 
 run_test "Touchpad motion conversion" "$TEST_DIR/test-touchpad-motion"
 
+gcc -O2 -Wall -Wextra -Werror $(pkg-config --cflags libevdev) \
+  -o "$TEST_DIR/test-touchpad-recovery" "$TEST_DIR/test-touchpad-recovery.c" \
+  $(pkg-config --libs libevdev) -lm
+run_test "Touchpad state recovery" "$TEST_DIR/test-touchpad-recovery"
+
 # ── 2. Monitor binary exists and starts ──
 run_test "Monitor binary exists" test -x "$PLUGIN_DIR/scripts/wiggle-monitor"
 
