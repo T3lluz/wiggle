@@ -3,9 +3,7 @@
 test-cursor-capabilities.py — Unit test suite for KDE-style cursor discovery and asset extraction
 
 Tests:
-  - Discrete XCursor with standard sizes (Adwaita): discovers sizes and extracts matching nominal size
-  - Discrete XCursor with high-res sizes (Banana): extracts matching nominal size (e.g. 32px), not oversized assets
-  - Hyprcursor theme (Banana-Hyprcursor, Bibata)
+  - Generated Xcursor themes: nominal size selection, high-DPI assets, and CLI discovery
   - Semantic cursor shapes / roles across themes (default, pointer, text, resize)
   - Scalable Hyprcursor with SVG
   - Scalable Hyprcursor with bilinear PNG resampling
@@ -21,6 +19,7 @@ import os
 import sys
 import tempfile
 import subprocess
+import struct
 from pathlib import Path
 
 # Import discovery helpers
@@ -55,59 +54,46 @@ def main():
     print("Wiggle KDE-Style Cursor Capability & Asset Extraction Tests")
     print("==========================================================\n")
 
-    # 1. Real Installed Themes — High-DPI Crisp Asset Extraction
-    adwaita_dir = "/usr/share/icons/Adwaita"
-    if os.path.isdir(adwaita_dir):
-        sizes = probe_xcursor(adwaita_dir)
-        path96, hx96, hy96, w96, h96 = export_xcursor_image(adwaita_dir, 96)
-        test("Adwaita (XCursor): discovers sizes [24..96] and extracts high-res 96px asset",
-             sizes == [24, 30, 36, 48, 72, 96] and w96 == 96 and h96 == 96 and hx96 > 0 and hy96 > 0 and os.path.isfile(path96))
-
-    bibata_dir = "/usr/share/icons/Bibata-Catppuccin-Mocha"
-    if os.path.isdir(bibata_dir):
-        sizes = probe_xcursor(bibata_dir)
-        path96, hx96, hy96, w96, h96 = export_xcursor_image(bibata_dir, 96)
-        test("Bibata-Catppuccin-Mocha (XCursor): extracts high-res asset (96px)",
-             len(sizes) > 0 and w96 == 96 and h96 == 96 and hx96 >= 0 and hy96 >= 0 and os.path.isfile(path96))
-
-    banana_dir = find_theme_dir("Banana")
-    if banana_dir and os.path.isdir(banana_dir):
-        sizes = probe_xcursor(banana_dir)
-        path96, hx96, hy96, w96, h96 = export_xcursor_image(banana_dir, 96)
-        test("Banana (XCursor): extracts high-res asset (96px) with accurate hotspot",
-             w96 == 96 and h96 == 96 and hx96 > 0 and hy96 > 0 and os.path.isfile(path96))
-
-    banana_hypr_dir = find_theme_dir("CursorSwitcher-XCursor-CursorSwitcher-Imported-Banana-542bccf69750-50dae6c5fdab")
-    if banana_hypr_dir and os.path.isdir(banana_hypr_dir):
-        h_back, h_cap, h_sizes = probe_hyprcursor(banana_hypr_dir)
-        path96, hx96, hy96, w96, h96 = export_hyprcursor_image(banana_hypr_dir, 96)
-        test("Banana-Hyprcursor: extracts high-res asset (96px) with valid hotspot",
-             h_back == "hyprcursor_discrete" and w96 == 96 and h96 == 96 and hx96 > 0 and hy96 > 0 and os.path.isfile(path96))
-
-    # 2. Semantic Roles & Shapes Across Themes
-    if os.path.isdir(banana_dir):
-        roles_ok = True
+    # Generated Xcursor assets make size/role checks independent of installed themes.
+    with tempfile.TemporaryDirectory() as tmp:
+        theme = Path(tmp) / ".local/share/icons/WiggleFixture"
+        cursors = theme / "cursors"
+        cursors.mkdir(parents=True)
+        chunks = []
+        entries = []
+        offset = 16 + 2 * 12
+        for nominal, pixels in [(24, 24), (32, 96)]:
+            chunk = struct.pack(
+                "<9I", 36, discover_module.XCURSOR_IMAGE_TYPE, nominal, 1,
+                pixels, pixels, pixels // 8, pixels // 8, 0
+            ) + struct.pack("<I", 0xff336699) * (pixels * pixels)
+            entries.append(struct.pack("<3I", discover_module.XCURSOR_IMAGE_TYPE, nominal, offset))
+            chunks.append(chunk)
+            offset += len(chunk)
+        data = struct.pack("<4I", discover_module.XCURSOR_MAGIC, 16,
+                           discover_module.XCURSOR_FILE_VERSION, 2) + b"".join(entries + chunks)
         for role in ["default", "pointer", "text", "resize"]:
-            p, hx, hy, w, h = export_xcursor_image(banana_dir, 32, shape_name=role)
-            if not (os.path.isfile(p) and w == 32 and h == 32 and hx >= 0 and hy >= 0):
-                roles_ok = False
-        test("Banana (XCursor) roles: default, pointer, text, resize resolve at nominal size 32", roles_ok)
-
-    if os.path.isdir(banana_hypr_dir):
-        roles_ok = True
+            (cursors / role).write_bytes(data)
+        test("Xcursor fixture: discovers nominal sizes independently of pixel dimensions",
+             probe_xcursor(str(theme)) == [24, 32])
+        high_res_available = True
         for role in ["default", "pointer", "text", "resize"]:
-            p, hx, hy, w, h = export_hyprcursor_image(banana_hypr_dir, 32, shape_name=role)
-            if not (os.path.isfile(p) and w == 32 and h == 32 and hx >= 0 and hy >= 0):
-                roles_ok = False
-        test("Banana-Hyprcursor roles: default, pointer, text, resize resolve at nominal size 32", roles_ok)
-
-    if os.path.isdir(adwaita_dir):
-        roles_ok = True
-        for role in ["default", "pointer", "text", "resize"]:
-            p, hx, hy, w, h = export_xcursor_image(adwaita_dir, 24, shape_name=role)
-            if not (os.path.isfile(p) and w in (24, 30) and h in (24, 30) and hx >= 0 and hy >= 0):
-                roles_ok = False
-        test("Adwaita roles: default, pointer, text, resize resolve cleanly", roles_ok)
+            path, hx, hy, width, height = export_xcursor_image(str(theme), 32, role)
+            high_res_available &= width == 96 and height == 96
+            test(f"Xcursor {role}: nominal 32 preserves 96px asset and hotspot",
+                 width == 96 and height == 96 and hx == 12 and hy == 12 and os.path.isfile(path))
+            path, hx, hy, width, height = export_xcursor_image(str(theme), 24, role)
+            test(f"Xcursor {role}: nominal 24 selects the 24px asset",
+                 width == 24 and height == 24 and hx == 3 and hy == 3 and os.path.isfile(path))
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).parent.parent / "scripts/wiggle-discover-cursor"),
+                 "--theme", "WiggleFixture", "--size", "32", "--shape", role],
+                env=dict(os.environ, HOME=tmp), capture_output=True, text=True)
+            fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+            test(f"Discovery CLI {role}: requested theme, size and high-DPI asset preserved",
+                 result.returncode == 0 and fields.get("STATUS") == "OK"
+                 and fields.get("THEME") == "WiggleFixture" and fields.get("SIZE") == "32"
+                 and fields.get("CURSOR_IMAGE_SIZE") == "96,96")
 
     # 3. Hyprcursor SVG Fixture
     with tempfile.TemporaryDirectory() as tmp:
@@ -244,7 +230,7 @@ def main():
     # 11. Graphical Magnification Invariance Assertion
     # Verify that Wiggle discovery provides high-resolution base texture for crisp graphical scaling
     test("Graphical magnification invariance: discovery provides high-res visual, scale is purely graphical",
-         w96 == 96 and h96 == 96)
+         high_res_available)
 
     print("\n==========================================================")
     print(f"Results: {passed}/{total} tests passed")

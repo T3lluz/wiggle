@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 tests/test-shake-detector
+tests/test-touchpad-motion
+tests/test-touchpad-recovery
 native/build/
 build/
 *.o

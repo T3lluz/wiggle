@@ -33,6 +33,9 @@ Item {
   readonly property int failsafeTimeoutMs: 5000
   readonly property int cursorHandoffTimeoutMs: 350
   readonly property int renderGraceMs: 20
+  // Hyprland applies cursor:invisible from a 500ms ticker, so the native
+  // cursor can stay hidden for up to 500ms after SHOW is acknowledged.
+  readonly property int proxyReleaseDelayMs: 550
 
   // ── Universal Theme & Asset State ───────────────────────────────────────
   property string cursorTheme: ""
@@ -286,6 +289,7 @@ Item {
 
   function beginActivation(newTarget) {
     warmupWaitTimer.stop()
+    proxyReleaseTimer.stop()
     root.pendingActivation = false
     root.pendingMagnification = 1.0
     root.currentMagnification = 1.0
@@ -363,10 +367,15 @@ Item {
     handoffTimer.stop()
     root.awaitingShownAck = false
     root.cursorRestoreDegraded = false
-    root.proxyActive = false
     root.currentMagnification = 1.0
     root.targetMagnification = 1.0
     deflateTimer.stop()
+    // Keep the 1x proxy up until the native cursor is actually drawn again.
+    proxyReleaseTimer.restart()
+  }
+
+  function releaseProxy() {
+    root.proxyActive = false
     root.discoverCursorSettings()
   }
 
@@ -389,6 +398,7 @@ Item {
   }
 
   function restoreState() {
+    proxyReleaseTimer.stop()
     deflateTimer.stop()
     safetyTimer.stop()
     handoffTimer.stop()
@@ -423,6 +433,13 @@ Item {
         }
       }
     }
+  }
+
+  Timer {
+    id: proxyReleaseTimer
+    interval: root.proxyReleaseDelayMs
+    repeat: false
+    onTriggered: root.releaseProxy()
   }
 
   Timer {

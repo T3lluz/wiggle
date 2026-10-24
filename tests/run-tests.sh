@@ -36,6 +36,18 @@ gcc -O2 -Wall -Wextra -Werror \
 
 run_test "Shake detection algorithm" "$TEST_DIR/test-shake-detector"
 
+echo "Building touchpad motion tests..."
+gcc -O2 -Wall -Wextra -Werror \
+  -o "$TEST_DIR/test-touchpad-motion" \
+  "$TEST_DIR/test-touchpad-motion.c" -lm 2>&1
+
+run_test "Touchpad motion conversion" "$TEST_DIR/test-touchpad-motion"
+
+gcc -O2 -Wall -Wextra -Werror $(pkg-config --cflags libevdev) \
+  -o "$TEST_DIR/test-touchpad-recovery" "$TEST_DIR/test-touchpad-recovery.c" \
+  $(pkg-config --libs libevdev) -lm
+run_test "Touchpad state recovery" "$TEST_DIR/test-touchpad-recovery"
+
 # ── 2. Monitor binary exists and starts ──
 run_test "Monitor binary exists" test -x "$PLUGIN_DIR/scripts/wiggle-monitor"
 
@@ -121,6 +133,12 @@ run_test "Cursor restoration remains visible on acknowledgement failure" bash -c
   awk '/Component.onDestruction:/{seen=1} seen && /restoreState\(\)/{restore=NR} seen && /stopMonitor\(\)/{stop=NR; exit} END{exit !(restore && stop && restore < stop)}' '$PLUGIN_DIR/Wiggle.qml'
 "
 
+run_test "Proxy outlives Hyprland's cursor visibility tick" bash -c "
+  grep -q 'proxyReleaseDelayMs: 550' '$PLUGIN_DIR/Wiggle.qml' &&
+  grep -q 'proxyReleaseTimer.restart()' '$PLUGIN_DIR/Wiggle.qml' &&
+  grep -q 'TRACK_AFTER_SHOW_MS' '$PLUGIN_DIR/scripts/wiggle-monitor.c'
+"
+
 run_test "Warm-up state handles monitor removal" bash -c "
   grep -q 'unregisterWarmupWindow' '$PLUGIN_DIR/Wiggle.qml' &&
   grep -q 'Component.onDestruction: root.unregisterWarmupWindow' '$PLUGIN_DIR/Wiggle.qml'
@@ -139,23 +157,6 @@ run_test "Real proxy render path is prewarmed" bash -c "
 run_test "Render handoff uses supported QsWindow API" bash -c "
   ! grep -q 'onFrameSwapped' '$PLUGIN_DIR/Wiggle.qml' &&
   ! grep -q '\\.update()' '$PLUGIN_DIR/Wiggle.qml'
-"
-
-# ── 11. Theme & Nominal Size Integrity (Banana, Adwaita, Bibata) ──
-run_test "Banana visual preservation & high-DPI asset extraction" bash -c "
-  out=\$('$PLUGIN_DIR/scripts/wiggle-discover-cursor' --theme Banana --size 32)
-  echo \"\$out\" | grep -q 'THEME=Banana' &&
-  echo \"\$out\" | grep -q 'SIZE=32' &&
-  echo \"\$out\" | grep -q 'CURSOR_IMAGE_SIZE=96,96'
-"
-
-run_test "Banana semantic roles (pointer, text, resize)" bash -c "
-  out_p=\$('$PLUGIN_DIR/scripts/wiggle-discover-cursor' --theme Banana --size 32 --shape pointer)
-  out_t=\$('$PLUGIN_DIR/scripts/wiggle-discover-cursor' --theme Banana --size 32 --shape text)
-  out_r=\$('$PLUGIN_DIR/scripts/wiggle-discover-cursor' --theme Banana --size 32 --shape resize)
-  echo \"\$out_p\" | grep -q 'STATUS=OK' &&
-  echo \"\$out_t\" | grep -q 'STATUS=OK' &&
-  echo \"\$out_r\" | grep -q 'STATUS=OK'
 "
 
 run_test "No global cursor mutation or setcursor calls" bash -c "

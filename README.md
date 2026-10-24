@@ -21,7 +21,7 @@ https://github.com/user-attachments/assets/d1133515-9c44-48a9-8b22-29bc225317ae
 * **Universal Single Proxy Overlay:** Renders identically across applications (terminals, browsers), empty workspaces, and desktop backgrounds on a click-through, focusless overlay (`WlrLayer.Overlay`).
 * **Hotspot-Anchored Precision:** Scales precisely around the cursor hotspot with zero pointer tip drift across all magnification levels.
 * **Theme-Agnostic Asset Discovery:** Automatically discovers the active theme and extracts the highest-resolution arrow/default cursor asset (XCursor bitmaps up to 96px+ or Hyprcursor SVGs).
-* **Defensive Cursor Handoff:** The proxy is presented at 1x before the native cursor is hidden, and HIDE/SHOW operations require compositor acknowledgements. Normal termination and handled failure paths request native-cursor restoration; an unconfirmed SHOW keeps the proxy available as a fallback.
+* **Defensive Cursor Handoff:** The proxy is presented at 1x before the native cursor is hidden, and HIDE/SHOW operations require compositor acknowledgements. After SHOW is acknowledged the 1x proxy stays up for 550ms, because Hyprland only applies `cursor:invisible` on its next 500ms cursor tick. Normal termination and handled failure paths request native-cursor restoration; an unconfirmed SHOW keeps the proxy available as a fallback.
 
 ---
 
@@ -63,7 +63,7 @@ omarchy plugin remove io.github.sanjyay.wiggle
 ## Architecture & Security
 
 * **Permissions & Device Access:** The bundled `wiggle-monitor` helper opens pointer devices in `/dev/input/event*` using `libevdev`. Stock Omarchy Quattro automatically provisions desktop users into the `input` group during system installation and user creation (`install/hardware/input-group.sh` and `bin/omarchy-provision-owner`), granting required read permissions without requiring `sudo`, custom udev rules, or privileged setup.
-* **Input Minimization:** The monitor opens only devices with relative pointer axes (`REL_X`, `REL_Y`). Composite receiver nodes may also advertise keyboard capabilities, but all `EV_KEY` and button events are discarded. Touchscreens and touchpads are explicitly rejected. The monitor never injects input and never uses `EVIOCGRAB`.
+* **Input Minimization:** The monitor opens only pointer devices: mice with relative axes (`REL_X`, `REL_Y`) and touchpads (absolute `ABS_X`/`ABS_Y` with finger tools). Composite receiver nodes may also advertise keyboard capabilities, but all mouse `EV_KEY` and button events are discarded. From touchpads only the finger position, contact and finger count are read; multi-finger gestures are ignored. Touchscreens, tablets and pens are rejected. The monitor never injects input and never uses `EVIOCGRAB`.
 * **Privacy & Memory Safety:** Cursor coordinates are queried over local Hyprland IPC when a shake is detected and while the proxy may need to track the pointer. Coordinates exist solely in volatile memory and are never persisted to disk, logged in production, or sent over any network.
 * **No Network:** Wiggle performs zero network operations, contains no HTTP/socket network libraries, and includes no analytics, telemetry, or remote dependencies.
 * **Filesystem Safety:** Temporary extracted cursor assets are written exclusively to `$XDG_RUNTIME_DIR/wiggle/` with strict `0700` directory and `0600` file permissions.
@@ -86,7 +86,7 @@ omarchy plugin remove io.github.sanjyay.wiggle
 * **Hyprland** (0.50+)
 * **libevdev** (standard on Arch Linux / Omarchy)
 * **Python 3** (standard system Python for high-res asset discovery)
-* Read access to relative pointer devices under `/dev/input` (stock Omarchy user provisioning supplies this through the `input` group)
+* Read access to mouse and touchpad devices under `/dev/input` (stock Omarchy user provisioning supplies this through the `input` group)
 
 ---
 
@@ -105,7 +105,7 @@ The verifier reports the reviewed source hash, exact compiler/linker/strip and d
 ## Troubleshooting
 
 * Confirm discovery and enabled state with `omarchy plugin list`.
-* If no shake is detected, confirm your user can read the relevant `/dev/input/event*` pointer device and log out/in after any group-membership change.
+* If no shake is detected, confirm your user can read the relevant `/dev/input/event*` mouse or touchpad device and log out/in after any group-membership change.
 * If the cursor theme cannot be resolved, Wiggle remains in native-cursor mode; check `HYPRCURSOR_THEME`, `XCURSOR_THEME`, and the corresponding size variables.
 * Reload after configuration or plugin updates with `omarchy restart shell`.
 * Omarchy plugins share Quickshell's GUI thread. A plugin performing long synchronous QML or JavaScript work can temporarily stall shell animations, including Wiggle.
