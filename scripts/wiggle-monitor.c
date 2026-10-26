@@ -44,6 +44,8 @@
 #define TRACK_ACTIVE_WINDOW_MS  2500
 #define TRACK_AFTER_SHOW_MS     600    // Outlasts the shell's 1x proxy release delay
 #define IPC_RESPONSE_TIMEOUT_MS 300
+#define HIDE_APPLY_TIMEOUT_MS   600    // Hyprland's cursor tick is 500 ms
+#define HIDE_CHECK_INTERVAL_MS  10
 #define TOUCHPAD_COUNTS_PER_MM  40.0   // Roughly a 1000 DPI mouse
 #define TOUCHPAD_FALLBACK_MM    100.0  // Assumed pad width when no resolution is reported
 
@@ -112,91 +114,55 @@ static bool write_all(int fd, const char *data, size_t length) {
     return true;
 }
 
-static bool set_compositor_cursor_invisible(bool invisible) {
+/*
+ * Sends one request to Hyprland's command socket and reads the full reply.
+ * Replies larger than the buffer are truncated.
+ */
+static bool hypr_request(const char *request, char *response, size_t size) {
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     const char *signature = getenv("HYPRLAND_INSTANCE_SIGNATURE");
     if (!runtime || !signature) return false;
 
-    char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
-    int length = snprintf(path, sizeof(path), "%s/hypr/%s/.socket.sock",
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    int length = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/hypr/%s/.socket.sock",
                           runtime, signature);
-    if (length < 0 || (size_t)length >= sizeof(path)) return false;
+    if (length < 0 || (size_t)length >= sizeof(addr.sun_path)) return false;
 
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return false;
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return false;
-    }
-    char request[128];
-    int req_len = snprintf(request, sizeof(request),
-                           "/eval hl.config({ cursor = { invisible = %s } })",
-                           invisible ? "true" : "false");
-    if (req_len <= 0 || !write_all(fd, request, (size_t)req_len)) {
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        !write_all(fd, request, strlen(request)) ||
+        shutdown(fd, SHUT_WR) < 0) {
         close(fd);
         return false;
     }
 
-    if (shutdown(fd, SHUT_WR) < 0) {
-        close(fd);
-        return false;
-    }
+    size_t used = 0;
+    while (used < size - 1) {
+        struct pollfd response_poll = { .fd = fd, .events = POLLIN };
+        if (poll(&response_poll, 1, IPC_RESPONSE_TIMEOUT_MS) <= 0) break;
 
-    struct pollfd response_poll = { .fd = fd, .events = POLLIN };
-    int ready = poll(&response_poll, 1, IPC_RESPONSE_TIMEOUT_MS);
-    if (ready <= 0 || !(response_poll.revents & POLLIN)) {
-        close(fd);
-        return false;
+        ssize_t n = read(fd, response + used, size - 1 - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        used += (size_t)n;
     }
-
-    char response[128];
-    ssize_t used = read(fd, response, sizeof(response) - 1);
     close(fd);
-    if (used <= 0) return false;
     response[used] = '\0';
-    return response_is_ok(response);
+    return used > 0;
+}
+
+static bool set_compositor_cursor_invisible(bool invisible) {
+    char response[128];
+    const char *request = invisible
+        ? "/eval hl.config({ cursor = { invisible = true } })"
+        : "/eval hl.config({ cursor = { invisible = false } })";
+    return hypr_request(request, response, sizeof(response)) && response_is_ok(response);
 }
 
 static int query_compositor_cursor(int *x, int *y) {
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
-    const char *signature = getenv("HYPRLAND_INSTANCE_SIGNATURE");
-    if (!runtime || !signature) return 0;
-
-    char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
-    int length = snprintf(path, sizeof(path), "%s/hypr/%s/.socket.sock",
-                          runtime, signature);
-    if (length < 0 || (size_t)length >= sizeof(path)) return 0;
-
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return 0;
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return 0;
-    }
-    static const char request[] = "j/cursorpos";
-    if (!write_all(fd, request, sizeof(request) - 1)) {
-        close(fd);
-        return 0;
-    }
-    if (shutdown(fd, SHUT_WR) < 0) {
-        close(fd);
-        return 0;
-    }
-    struct pollfd response_poll = { .fd = fd, .events = POLLIN };
-    int ready = poll(&response_poll, 1, IPC_RESPONSE_TIMEOUT_MS);
-    if (ready <= 0 || !(response_poll.revents & POLLIN)) {
-        close(fd);
-        return 0;
-    }
     char response[256];
-    ssize_t used = read(fd, response, sizeof(response) - 1);
-    close(fd);
-    if (used <= 0) return 0;
-    response[used] = '\0';
+    if (!hypr_request("j/cursorpos", response, sizeof(response))) return 0;
 
     const char *px = strstr(response, "\"x\"");
     const char *py = strstr(response, "\"y\"");
@@ -208,6 +174,17 @@ static int query_compositor_cursor(int *x, int *y) {
         }
     }
     return 0;
+}
+
+/*
+ * Hyprland applies cursor:invisible on a 500 ms tick rather than when the
+ * option changes. Monitors list HW_CURSOR under tearingBlockedBy while a
+ * hardware cursor is actually on screen, which tells us when that happened.
+ */
+static bool hardware_cursor_visible(void) {
+    static char response[65536];
+    return hypr_request("j/monitors", response, sizeof(response)) &&
+           strstr(response, "\"HW_CURSOR\"") != NULL;
 }
 
 /* ─── Monotonic Clock ─── */
@@ -546,6 +523,9 @@ int main(int argc, char *argv[]) {
     bool compositor_cursor_hidden = false;
     int last_pos_x = INT_MIN;
     int last_pos_y = INT_MIN;
+    bool hide_pending = false;
+    int64_t hide_deadline = 0;
+    int64_t next_hide_check = 0;
 
     while (g_running) {
         // Place inotify and stdin at the end of pollfds
@@ -593,10 +573,19 @@ int main(int argc, char *argv[]) {
                     if (strcmp(command, "HIDE") == 0) {
                         /* Track conservatively until SHOW is positively acknowledged. */
                         compositor_cursor_hidden = true;
-                        bool hidden = set_compositor_cursor_invisible(true);
-                        printf(hidden ? "HIDDEN\n" : "HIDE_FAILED\n");
+                        bool was_visible = hardware_cursor_visible();
+                        if (!set_compositor_cursor_invisible(true)) {
+                            printf("HIDE_FAILED\n");
+                        } else if (was_visible) {
+                            /* Confirm once the cursor is really gone, see below */
+                            hide_pending = true;
+                            hide_deadline = now_ms() + HIDE_APPLY_TIMEOUT_MS;
+                        } else {
+                            printf("HIDDEN\n");
+                        }
                         fflush(stdout);
                     } else if (strcmp(command, "SHOW") == 0) {
+                        hide_pending = false;
                         bool shown = set_compositor_cursor_invisible(false);
                         if (shown) {
                             compositor_cursor_hidden = false;
@@ -701,6 +690,7 @@ int main(int argc, char *argv[]) {
          * movement, leaving the proxy short of the real pointer.
          */
         ts = now_ms();
+
         if (!handoff_pending && (ts < track_until || compositor_cursor_hidden) &&
             ts >= next_track) {
             int cur_x, cur_y;
@@ -712,6 +702,19 @@ int main(int argc, char *argv[]) {
                 last_pos_y = cur_y;
             }
             next_track = ts + TRACK_INTERVAL_MS;
+        }
+
+        /*
+         * The shell keeps the proxy at 1x until HIDDEN arrives, so it never
+         * grows while the small native cursor is still drawn on top.
+         */
+        if (hide_pending && ts >= next_hide_check) {
+            if (ts >= hide_deadline || !hardware_cursor_visible()) {
+                hide_pending = false;
+                printf("HIDDEN\n");
+                fflush(stdout);
+            }
+            next_hide_check = ts + HIDE_CHECK_INTERVAL_MS;
         }
     }
 
