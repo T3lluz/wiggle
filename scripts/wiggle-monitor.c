@@ -46,6 +46,10 @@
 #define IPC_RESPONSE_TIMEOUT_MS 300
 #define HIDE_APPLY_TIMEOUT_MS   600    // Hyprland's cursor tick is 500 ms
 #define HIDE_CHECK_INTERVAL_MS  10
+#define TRAVEL_SAMPLE_COUNT     32
+#define TRAVEL_INTERVAL_MS      50
+#define MIN_POINTER_TRAVEL_PX   48.0   // Compositor pixels the pointer must cover during a shake
+#define IGNORED_LOG_INTERVAL_MS 10000
 #define TOUCHPAD_COUNTS_PER_MM  40.0   // Roughly a 1000 DPI mouse
 #define TOUCHPAD_FALLBACK_MM    100.0  // Assumed pad width when no resolution is reported
 
@@ -89,10 +93,23 @@ typedef struct {
     TouchpadState    touchpad;
 } DeviceState;
 
+typedef struct {
+    int     x;
+    int     y;
+    int64_t timestamp_ms;
+} PointerSample;
+
+typedef struct {
+    PointerSample samples[TRAVEL_SAMPLE_COUNT];
+    int           next;
+    int           count;
+} PointerTravel;
+
 /* ─── Globals ─── */
 
 static volatile sig_atomic_t g_running = 1;
 static ShakeDetector g_detector = {0};
+static PointerTravel g_travel = {0};
 
 /* ─── Compositor IPC & Fail-Safe ─── */
 
@@ -176,15 +193,49 @@ static int query_compositor_cursor(int *x, int *y) {
     return 0;
 }
 
+static const char *query_monitors(void) {
+    static char response[65536];
+    return hypr_request("j/monitors", response, sizeof(response)) ? response : NULL;
+}
+
 /*
- * Hyprland applies cursor:invisible on a 500 ms tick rather than when the
- * option changes. Monitors list HW_CURSOR under tearingBlockedBy while a
- * hardware cursor is actually on screen, which tells us when that happened.
+ * Monitors list HW_CURSOR under tearingBlockedBy while a hardware cursor is
+ * actually on screen. Unlike the cursor:invisible option, which Hyprland only
+ * applies on its 500 ms cursor tick, this follows what is really drawn.
  */
 static bool hardware_cursor_visible(void) {
-    static char response[65536];
-    return hypr_request("j/monitors", response, sizeof(response)) &&
-           strstr(response, "\"HW_CURSOR\"") != NULL;
+    const char *monitors = query_monitors();
+    return monitors && strstr(monitors, "\"HW_CURSOR\"");
+}
+
+/*
+ * Whether Hyprland draws a cursor at all. Games hide it by not setting a
+ * cursor image, which also clears HW_CURSOR. With software cursors (SW under
+ * directScanoutBlockedBy) this can't be told, so the cursor counts as drawn.
+ */
+static bool cursor_drawn(void) {
+    const char *monitors = query_monitors();
+    return !monitors || strstr(monitors, "\"HW_CURSOR\"") || strstr(monitors, "\"SW\"");
+}
+
+/*
+ * Wine/Proton games confine the pointer and draw a transparent cursor, so
+ * neither the travel nor the drawn-cursor check catches them. They run as
+ * fullscreen XWayland windows, unlike browsers and video players, which are
+ * native Wayland clients. Some clients also mark themselves as games.
+ */
+static bool focused_window_is_game(void) {
+    char response[8192];
+    if (!hypr_request("j/activewindow", response, sizeof(response))) return false;
+
+    if (strstr(response, "\"contentType\": \"game\"")) return true;
+
+    int fullscreen = 0;
+    const char *key = strstr(response, "\"fullscreen\":");
+    if (key) sscanf(key + strlen("\"fullscreen\":"), "%d", &fullscreen);
+
+    // Mode 1 is maximized; bit 2 is real fullscreen
+    return (fullscreen & 2) && strstr(response, "\"xwayland\": true");
 }
 
 /* ─── Monotonic Clock ─── */
@@ -292,6 +343,49 @@ static bool detector_update(ShakeDetector *det, double dx, double dy, int64_t ts
     }
 
     return false;
+}
+
+/* ─── Pointer Travel ─── */
+
+static void travel_add(PointerTravel *travel, int x, int y, int64_t ts) {
+    travel->samples[travel->next] = (PointerSample){ .x = x, .y = y, .timestamp_ms = ts };
+    travel->next = (travel->next + 1) % TRAVEL_SAMPLE_COUNT;
+    if (travel->count < TRAVEL_SAMPLE_COUNT) travel->count++;
+}
+
+// Diagonal of the area the compositor pointer covered within the shake window
+static double travel_extent(const PointerTravel *travel, int64_t ts) {
+    bool found = false;
+    int left = 0, right = 0, top = 0, bottom = 0;
+
+    for (int i = 0; i < travel->count; i++) {
+        const PointerSample *sample = &travel->samples[i];
+        if (ts - sample->timestamp_ms >= HISTORY_INTERVAL_MS) continue;
+
+        if (!found || sample->x < left) left = sample->x;
+        if (!found || sample->x > right) right = sample->x;
+        if (!found || sample->y < top) top = sample->y;
+        if (!found || sample->y > bottom) bottom = sample->y;
+        found = true;
+    }
+
+    double width = right - left;
+    double height = bottom - top;
+    return sqrt(width * width + height * height);
+}
+
+/*
+ * KWin ignores shakes while the pointer is constrained. Hyprland doesn't
+ * expose that over IPC, so look at what games do instead: a locked pointer
+ * is held in place and never travels, a confined one is usually hidden, and
+ * the window is fullscreen. While the proxy is up we hide the cursor
+ * ourselves, so the drawn-cursor check only applies to the first shake.
+ */
+static const char *shake_rejection(int64_t ts, bool proxy_engaged) {
+    if (travel_extent(&g_travel, ts) < MIN_POINTER_TRAVEL_PX) return "pointer did not move";
+    if (!proxy_engaged && !cursor_drawn()) return "cursor is hidden";
+    if (focused_window_is_game()) return "focused window is a fullscreen XWayland game";
+    return NULL;
 }
 
 /* ─── Touchpad Motion ─── */
@@ -526,6 +620,8 @@ int main(int argc, char *argv[]) {
     bool hide_pending = false;
     int64_t hide_deadline = 0;
     int64_t next_hide_check = 0;
+    int64_t next_travel_sample = 0;
+    int64_t last_ignored_log = -IGNORED_LOG_INTERVAL_MS;
 
     while (g_running) {
         // Place inotify and stdin at the end of pollfds
@@ -648,9 +744,28 @@ int main(int argc, char *argv[]) {
                     if (dx == 0 && dy == 0)
                         continue;
 
+                    if (ts >= next_travel_sample) {
+                        int cur_x, cur_y;
+                        if (query_compositor_cursor(&cur_x, &cur_y))
+                            travel_add(&g_travel, cur_x, cur_y, ts);
+                        next_travel_sample = ts + TRAVEL_INTERVAL_MS;
+                    }
+
                     if (detector_update(&g_detector, dx, dy, ts)) {
                         int cur_x, cur_y;
                         if (query_compositor_cursor(&cur_x, &cur_y)) {
+                            travel_add(&g_travel, cur_x, cur_y, ts);
+
+                            const char *rejection = shake_rejection(
+                                ts, compositor_cursor_hidden || ts < track_until);
+                            if (rejection) {
+                                if (ts - last_ignored_log >= IGNORED_LOG_INTERVAL_MS) {
+                                    fprintf(stderr, "wiggle-monitor: ignored shake, %s\n", rejection);
+                                    last_ignored_log = ts;
+                                }
+                                continue;
+                            }
+
                             printf("SHAKE %d %d\n", cur_x, cur_y);
                             fflush(stdout);
                             last_pos_x = cur_x;
