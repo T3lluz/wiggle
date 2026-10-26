@@ -521,7 +521,7 @@ Item {
     if (root.renderWarmupComplete && root.pendingActivation) {
       warmupWaitTimer.stop()
       root.beginActivation(root.pendingMagnification)
-      root.safetyTimer.restart()
+      safetyTimer.restart()
     }
   }
 
